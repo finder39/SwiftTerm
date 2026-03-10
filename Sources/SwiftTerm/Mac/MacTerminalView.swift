@@ -2003,7 +2003,7 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         }
     }
     
-    public override func scrollWheel(with event: NSEvent) {
+    open override func scrollWheel(with event: NSEvent) {
         if event.deltaY == 0 {
             return
         }
