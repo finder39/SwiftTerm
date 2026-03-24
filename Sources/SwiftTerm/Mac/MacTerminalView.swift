@@ -150,9 +150,9 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
     var urlAttributes: [Attribute: [NSAttributedString.Key:Any]] = [:]
     
     
-    /// Optional closure that remaps ANSI colors at render time.
-    /// Parameters are (color, isFg, isBold, useBrightColors). Return nil to use default behavior.
-    public var ansiColorMapper: ((Attribute.Color, Bool, Bool, Bool) -> NSColor?)?
+    /// Optional closure that remaps a resolved foreground/background pair at render time.
+    /// Return nil to use the resolved colors.
+    public var ansiColorPairMapper: ((Attribute, NSColor, NSColor) -> (foreground: NSColor, background: NSColor)?)?
 
     // Cache for the colors in the 0..255 range
     var colors: [NSColor?] = Array(repeating: nil, count: 256)

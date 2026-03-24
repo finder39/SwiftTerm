@@ -226,7 +226,9 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var link: CADisplayLink!
     /// Optional closure that remaps ANSI colors at render time.
     /// Parameters are (color, isFg, isBold, useBrightColors). Return nil to use default behavior.
-    public var ansiColorMapper: ((Attribute.Color, Bool, Bool, Bool) -> UIColor?)?
+    /// Optional closure that remaps a resolved foreground/background pair at render time.
+    /// Return nil to use the resolved colors.
+    public var ansiColorPairMapper: ((Attribute, UIColor, UIColor) -> (foreground: UIColor, background: UIColor)?)?
 
     // Cache for the colors in the 0..255 range
     var colors: [UIColor?] = Array(repeating: nil, count: 256)

@@ -219,9 +219,6 @@ extension TerminalView {
     
     func mapColor (color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool = true) -> TTColor
     {
-        if let mapped = ansiColorMapper?(color, isFg, isBold, useBrightColors) {
-            return mapped
-        }
         switch color {
         case .defaultColor:
             if isFg {
@@ -364,11 +361,16 @@ extension TerminalView {
         let flags = attribute.style
         var bg = andBg
         var fg = usingFg
-        
+
         if flags.contains (.inverse) {
             swap (&bg, &fg)
         }
-        
+
+        if let remapped = ansiColorPairMapper?(attribute, fg, bg) {
+            fg = remapped.foreground
+            bg = remapped.background
+        }
+
         var tf: TTFont
         let isBold = flags.contains(.bold)
         if isBold {
@@ -449,10 +451,14 @@ extension TerminalView {
         }
         
         var fgColor = mapColor (color: fg, isFg: true, isBold: isBold, useBrightColors: useBrightColors)
-        let bgColor = mapColor (color: bg, isFg: false, isBold: false)
+        var bgColor = mapColor (color: bg, isFg: false, isBold: false)
         // Apply dim/faint attribute (SGR 2)
         if flags.contains (.dim) {
             fgColor = fgColor.dimmedColor (towards: bgColor)
+        }
+        if let remapped = ansiColorPairMapper?(attribute, fgColor, bgColor) {
+            fgColor = remapped.foreground
+            bgColor = remapped.background
         }
         var nsattr: [NSAttributedString.Key:Any] = [
             .font: tf,
