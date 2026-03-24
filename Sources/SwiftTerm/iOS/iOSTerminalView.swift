@@ -224,6 +224,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     // Timer to display the terminal buffer
     var link: CADisplayLink!
+    /// Optional closure that remaps ANSI colors at render time.
+    /// Parameters are (color, isFg, isBold, useBrightColors). Return nil to use default behavior.
+    public var ansiColorMapper: ((Attribute.Color, Bool, Bool, Bool) -> UIColor?)?
+
     // Cache for the colors in the 0..255 range
     var colors: [UIColor?] = Array(repeating: nil, count: 256)
     var trueColors: [Attribute.Color:UIColor] = [:]

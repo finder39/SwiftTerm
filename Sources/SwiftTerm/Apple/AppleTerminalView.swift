@@ -219,6 +219,9 @@ extension TerminalView {
     
     func mapColor (color: Attribute.Color, isFg: Bool, isBold: Bool, useBrightColors: Bool = true) -> TTColor
     {
+        if let mapped = ansiColorMapper?(color, isFg, isBold, useBrightColors) {
+            return mapped
+        }
         switch color {
         case .defaultColor:
             if isFg {
