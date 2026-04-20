@@ -85,7 +85,28 @@ struct ViewLineInfo {
 
 extension TerminalView {
     typealias CellDimension = CGSize
-    
+
+#if os(macOS)
+    /// Controls whether font smoothing (sub-pixel rendering) is enabled during glyph drawing.
+    /// Set to `false` to get thinner strokes on Retina displays, matching iTerm2's "Thin strokes" setting.
+    /// Defaults to `true` (standard macOS font smoothing).
+    @objc open var fontSmoothing: Bool {
+        get { _fontSmoothing }
+        set { _fontSmoothing = newValue }
+    }
+#endif
+
+    /// Multiplier for vertical line spacing. 1.0 = default (ascent + descent + leading).
+    /// Set to 1.1 for 110% vertical spacing (matches iTerm2's vertical spacing setting).
+    /// Triggers a font reset and terminal resize when changed.
+    @objc open var lineSpacing: CGFloat {
+        get { _lineSpacing }
+        set {
+            _lineSpacing = newValue
+            resetFont()
+        }
+    }
+
     func resetCaches ()
     {
         self.attributes = [:]
@@ -99,10 +120,18 @@ extension TerminalView {
     {
         resetCaches()
         self.cellDimension = computeFontDimensions ()
-        let newCols = Int(frame.width / cellDimension.width)
-        let newRows = Int(frame.height / cellDimension.height)
-        resize(cols: newCols, rows: newRows)
+        if (frame.width > 0) && (frame.height > 0) {
+            let newCols = Int(frame.width / cellDimension.width)
+            let newRows = Int(frame.height / cellDimension.height)
+            resize(cols: newCols, rows: newRows)
+        }
         updateCaretView()
+        
+        #if os(macOS)
+        needsDisplay = true
+        #else
+        setNeedsDisplay(frame)
+        #endif
     }
     
     func updateCaretView ()
@@ -123,13 +152,16 @@ extension TerminalView {
         // Calculation assume that all glyphs in the font have the same advancement.
         // Get the ascent + descent + leading from the font, already scaled for the font's size
         self.cellDimension = computeFontDimensions ()
-        
-        let terminalOptions = TerminalOptions(cols: Int(width / cellDimension.width),
-                                              rows: Int(height / cellDimension.height))
-        
+
+        let zeroSizedView = width == 0 && height == 0
+        let terminalOptions = zeroSizedView
+            ? (terminal?.options ?? .default)
+            : TerminalOptions(cols: Int(width / cellDimension.width),
+                              rows: Int(height / cellDimension.height))
+
         if terminal == nil {
             terminal = Terminal(delegate: self, options: terminalOptions)
-        } else {
+        } else if !zeroSizedView {
             terminal.options = terminalOptions
             terminal.setup(isReset: false)
         }
@@ -166,6 +198,9 @@ extension TerminalView {
     /// Returns true if this changed the number of columns/rows, false otherwise
     @discardableResult
     func processSizeChange (newSize: CGSize) -> Bool {
+        if newSize.width == 0 && newSize.height == 0 {
+            return false
+        }
         let newRows = Int (newSize.height / cellDimension.height)
         let newCols = Int (getEffectiveWidth (size: newSize) / cellDimension.width)
         
@@ -191,7 +226,7 @@ extension TerminalView {
         let lineAscent = CTFontGetAscent (fontSet.normal)
         let lineDescent = CTFontGetDescent (fontSet.normal)
         let lineLeading = CTFontGetLeading (fontSet.normal)
-        let cellHeight = ceil(lineAscent + lineDescent + lineLeading)
+        let cellHeight = ceil((lineAscent + lineDescent + lineLeading) * _lineSpacing)
         #if os(macOS)
         // The following is a more robust way of getting the largest ascii character width, but comes with a performance hit.
         // See: https://github.com/migueldeicaza/SwiftTerm/issues/286
@@ -320,8 +355,36 @@ extension TerminalView {
 
     public func synchronizedOutputChanged (source: Terminal, active: Bool)
     {
-        updateScroller()
-        queuePendingDisplay()
+        if active {
+            // Sync block starting — cancel any pending sequence-end render.
+            syncEndRenderTimer?.cancel()
+            syncEndRenderTimer = nil
+            inSyncSequence = true
+        } else {
+            // Sync block ended — defer render by syncSequenceSettleMs.
+            //
+            // Terminal multiplexers (tmux) repaint the screen using multiple
+            // rapid BSU/ESU pairs delivered across separate I/O callbacks.
+            // Rendering between them shows partially-repainted intermediate
+            // states (visible as a scroll-through artifact).
+            //
+            // This coalescing delay lets the entire repaint sequence settle
+            // before rendering one atomic frame. If a new BSU arrives within
+            // the window, the render is cancelled and the window resets.
+            syncEndRenderTimer?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.syncEndRenderTimer = nil
+                self.inSyncSequence = false
+                self.updateScroller()
+                self.queuePendingDisplay()
+                self.terminalDelegate?.scrolled(source: self, position: self.scrollPosition)
+            }
+            syncEndRenderTimer = work
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(syncSequenceSettleMs),
+                execute: work)
+        }
     }
 
     public func setBackgroundColor(source: Terminal, color: Color) {
@@ -1187,7 +1250,7 @@ extension TerminalView {
             let renderMode = displayBuffer.lines [row].renderMode
             let lineOffset = calcLineOffset(forRow: row)
             let lineOrigin = CGPoint(x: 0, y: frame.height - lineOffset)
-            
+
             switch renderMode {
             case .single:
                 break
@@ -1364,8 +1427,8 @@ extension TerminalView {
             context.setShouldAntialias(true)
             context.setAllowsAntialiasing(true)
             #if os(macOS)
-            context.setShouldSmoothFonts(true)
-            context.setAllowsFontSmoothing(true)
+            context.setShouldSmoothFonts(fontSmoothing)
+            context.setAllowsFontSmoothing(fontSmoothing)
             #endif
 
             // Glyph drawing loop — reuses cached CTLines
@@ -1397,15 +1460,11 @@ extension TerminalView {
                             y: lineOrigin.y + yOffset + ctPosition.y)
                     }
 
-                    nativeForegroundColor.set()
+                    nativeForegroundColor.setFill()
 
                     if runAttributes.keys.contains(.foregroundColor) {
                         let color = runAttributes[.foregroundColor] as! TTColor
-                        let cgColor = color.cgColor
-                        if let colorSpace = cgColor.colorSpace {
-                            context.setFillColorSpace(colorSpace)
-                        }
-                        context.setFillColor(cgColor)
+                        color.setFill()
                     }
 
                     CTFontDrawGlyphs(runFont, runGlyphs, &positions, positions.count, context)
@@ -1571,6 +1630,8 @@ extension TerminalView {
     func updateDisplay (notifyAccessibility: Bool)
     {
         defer { pendingDisplay = false }
+        // Suppress during sync blocks and inter-block gaps.
+        guard !terminal.synchronizedOutputActive && !inSyncSequence else { return }
         updateCursorPosition()
         guard let (rowStart, rowEnd) = terminal.getUpdateRange () else {
             if notifyUpdateChanges {
@@ -1653,6 +1714,9 @@ extension TerminalView {
         
         if (notifyAccessibility) {
             accessibility.invalidate ()
+            #if os(iOS)
+            UIAccessibility.post(notification: .layoutChanged, argument: nil)
+            #endif
             #if os(macOS)
             NSAccessibility.post (element: self, notification: .valueChanged)
             NSAccessibility.post (element: self, notification: .selectedTextChanged)
@@ -1705,6 +1769,10 @@ extension TerminalView {
     // It is also cheap, so should be called when new data has been posted or received.
     func queuePendingDisplay ()
     {
+        // Suppress display updates during sync blocks and inter-block gaps.
+        if terminal.synchronizedOutputActive || inSyncSequence {
+            return
+        }
         // throttle
         if !pendingDisplay {
             let fps60 = 16670000
@@ -2268,7 +2336,7 @@ extension TerminalView {
     public func selectNone () {
         selection.selectNone()
     }
-    
+
 }
 
 #if canImport(UIKit) && DEBUG
