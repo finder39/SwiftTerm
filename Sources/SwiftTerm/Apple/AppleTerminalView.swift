@@ -355,35 +355,11 @@ extension TerminalView {
 
     public func synchronizedOutputChanged (source: Terminal, active: Bool)
     {
-        if active {
-            // Sync block starting — cancel any pending sequence-end render.
-            syncEndRenderTimer?.cancel()
-            syncEndRenderTimer = nil
-            inSyncSequence = true
-        } else {
-            // Sync block ended — defer render by syncSequenceSettleMs.
-            //
-            // Terminal multiplexers (tmux) repaint the screen using multiple
-            // rapid BSU/ESU pairs delivered across separate I/O callbacks.
-            // Rendering between them shows partially-repainted intermediate
-            // states (visible as a scroll-through artifact).
-            //
-            // This coalescing delay lets the entire repaint sequence settle
-            // before rendering one atomic frame. If a new BSU arrives within
-            // the window, the render is cancelled and the window resets.
-            syncEndRenderTimer?.cancel()
-            let work = DispatchWorkItem { [weak self] in
-                guard let self else { return }
-                self.syncEndRenderTimer = nil
-                self.inSyncSequence = false
-                self.updateScroller()
-                self.queuePendingDisplay()
-                self.terminalDelegate?.scrolled(source: self, position: self.scrollPosition)
-            }
-            syncEndRenderTimer = work
-            DispatchQueue.main.asyncAfter(
-                deadline: .now() + .milliseconds(syncSequenceSettleMs),
-                execute: work)
+        SyncDebug.log("delegate active=\(active)")
+        if !active {
+            updateScroller()
+            queuePendingDisplay()
+            terminalDelegate?.scrolled(source: self, position: scrollPosition)
         }
     }
 
@@ -1385,13 +1361,28 @@ extension TerminalView {
                             #endif
 
                             if endColumn >= terminal.cols {
-                                rect.size.width = frame.width - rect.origin.x
+                                if backgroundColor == nativeBackgroundColor {
+                                    rect.size.width = frame.width - rect.origin.x
+                                } else {
+                                    let marginX = rect.origin.x + rect.size.width
+                                    if marginX < frame.width {
+                                        let marginRect = CGRect(x: marginX, y: rect.origin.y, width: frame.width - marginX, height: rect.size.height)
+                                        #if os(macOS)
+                                        nativeBackgroundColor.setFill()
+                                        marginRect.fill()
+                                        #else
+                                        context.setFillColor(nativeBackgroundColor.cgColor)
+                                        context.fill(marginRect)
+                                        #endif
+                                    }
+                                }
                             }
 
                             #if os(macOS)
                             backgroundColor.setFill()
                             rect.fill()
                             #else
+                            context.setFillColor(backgroundColor.cgColor)
                             context.fill(rect)
                             #endif
                         }
@@ -1630,23 +1621,43 @@ extension TerminalView {
     func updateDisplay (notifyAccessibility: Bool)
     {
         defer { pendingDisplay = false }
-        // Suppress during sync blocks and inter-block gaps.
-        guard !terminal.synchronizedOutputActive && !inSyncSequence else { return }
+        if terminal.synchronizedOutputActive {
+            SyncDebug.log("paint-blocked sync=true")
+            return
+        }
         updateCursorPosition()
         guard let (rowStart, rowEnd) = terminal.getUpdateRange () else {
+            SyncDebug.log("paint-norange (cursor-only)")
             if notifyUpdateChanges {
                 let buffer = terminal.displayBuffer
                 let y = buffer.yDisp+buffer.y
                 terminalDelegate?.rangeChanged (source: self, startY: y, endY: y)
             }
+            // Pure cursor moves (e.g. CSI C / CSI D from word-jumps) don't
+            // mark any row dirty, so getUpdateRange() returns nil. With Metal
+            // the cursor is drawn by the renderer reading buffer.x/y at draw
+            // time, and MTKView is paused — without an explicit redraw the
+            // cursor stays at its old screen position until something else
+            // dirties a row. Trigger a redraw if the cursor moved.
+            #if canImport(MetalKit)
+            if metalView != nil {
+                let buffer = terminal.displayBuffer
+                let cursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
+                if lastRenderedCursor == nil || lastRenderedCursor! != cursor {
+                    lastRenderedCursor = cursor
+                    requestMetalDisplay()
+                }
+            }
+            #endif
             return
         }
         if notifyUpdateChanges {
             terminalDelegate?.rangeChanged (source: self, startY: rowStart, endY: rowEnd)
         }
 
+        SyncDebug.log("paint rows=\(rowStart)-\(rowEnd)")
         terminal.clearUpdateRange ()
-                
+
         #if os(macOS)
         let baseLine = frame.height
         var region = CGRect (x: 0,
@@ -1688,6 +1699,7 @@ extension TerminalView {
                     metalDirtyRange = nil
                 }
             }
+            lastRenderedCursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
             requestMetalDisplay()
         } else {
             setNeedsDisplay(region)
@@ -1701,6 +1713,8 @@ extension TerminalView {
         #if canImport(MetalKit)
         if metalView != nil {
             metalDirtyRange = metalVisibleRange()
+            let buffer = terminal.displayBuffer
+            lastRenderedCursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
             requestMetalDisplay()
         } else {
             setNeedsDisplay(bounds)
@@ -1769,8 +1783,8 @@ extension TerminalView {
     // It is also cheap, so should be called when new data has been posted or received.
     func queuePendingDisplay ()
     {
-        // Suppress display updates during sync blocks and inter-block gaps.
-        if terminal.synchronizedOutputActive || inSyncSequence {
+        if terminal.synchronizedOutputActive {
+            SyncDebug.log("queue-blocked sync=true")
             return
         }
         // throttle
@@ -1779,9 +1793,12 @@ extension TerminalView {
             // let fps30 = 16670000*2
             let fpsDelay = fps60
             pendingDisplay = true
+            SyncDebug.log("queue-scheduled (+16.67ms)")
             DispatchQueue.main.asyncAfter(
                 deadline: DispatchTime (uptimeNanoseconds: DispatchTime.now().uptimeNanoseconds + UInt64 (fpsDelay)),
                 execute: updateDisplay)
+        } else {
+            SyncDebug.log("queue-noop (already pending)")
         }
     }
 
@@ -1979,6 +1996,7 @@ extension TerminalView {
     
     func feedFinish ()
     {
+        SyncDebug.log("feedFinish sync=\(terminal.synchronizedOutputActive)")
         suspendDisplayUpdates ()
         queuePendingDisplay()
     }

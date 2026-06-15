@@ -186,4 +186,143 @@ struct MouseTrackingTests {
         let sentString = String(bytes: delegate.sentData.flatMap { $0 }, encoding: .utf8) ?? ""
         #expect(sentString == "\(esc)[<64;1;1M")
     }
+
+    @Test func xtshiftescapeDefaultsToOff() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+        #expect(terminal.mouseShiftCapture == false)
+    }
+
+    @Test func xtshiftescapeEnableAndDisable() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+
+        terminal.feed(text: "\(esc)[>1s")
+        #expect(terminal.mouseShiftCapture == true)
+
+        terminal.feed(text: "\(esc)[>0s")
+        #expect(terminal.mouseShiftCapture == false)
+    }
+
+    @Test func xtshiftescapeMissingParameterDisables() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[>1s")
+        #expect(terminal.mouseShiftCapture == true)
+
+        // Per xterm, `CSI > s` with no Ps is equivalent to Ps = 0.
+        terminal.feed(text: "\(esc)[>s")
+        #expect(terminal.mouseShiftCapture == false)
+    }
+
+    @Test func xtshiftescapeIgnoresUnknownParameter() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[>1s")
+        #expect(terminal.mouseShiftCapture == true)
+
+        // Unknown Ps values must leave the current state untouched.
+        terminal.feed(text: "\(esc)[>9s")
+        #expect(terminal.mouseShiftCapture == true)
+    }
+
+    @Test func xtshiftescapeClearedByHardReset() {
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[>1s")
+        #expect(terminal.mouseShiftCapture == true)
+
+        terminal.resetToInitialState()
+        #expect(terminal.mouseShiftCapture == false)
+    }
+
+    @Test func csiSWithUnknownIntermediateDoesNotSaveCursor() {
+        // Regression: CSI <intermediate> s with an intermediate other than '>'
+        // must not be routed to save-cursor or DECSLRM.
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+
+        // Position cursor at (col 10, row 5) and send "CSI ? s". If misrouted to
+        // save-cursor, this position would be saved.
+        terminal.feed(text: "\(esc)[5;10H")
+        terminal.feed(text: "\(esc)[?s")
+
+        // Move somewhere else, then restore.
+        terminal.feed(text: "\(esc)[1;1H")
+        terminal.feed(text: "\(esc)[u")
+
+        // Restore must fall back to the default saved position (0,0), not (9,4).
+        #expect(terminal.buffer.x == 0)
+        #expect(terminal.buffer.y == 0)
+    }
+
+    // MARK: - DECRST on encoding modes (1005/1006/1015/1016) must not stop tracking
+
+    @Test func decrstEncodingModeKeepsTrackingEnabled() {
+        // 1005/1006/1015/1016 select the coordinate encoding and are independent of
+        // the tracking modes (9/1000-1003): resetting an encoding reverts how
+        // coordinates are encoded, it must not turn tracking off (in xterm these are
+        // separate state variables: extend_coords vs send_mouse_pos).
+        for encodingMode in [1005, 1006, 1015, 1016] {
+            let (terminal, _) = TerminalTestHarness.makeTerminal()
+            terminal.feed(text: "\(esc)[?1003h")
+            terminal.feed(text: "\(esc)[?\(encodingMode)h")
+            terminal.feed(text: "\(esc)[?\(encodingMode)l")
+            #expect(terminal.mouseMode == .anyEvent, "DECRST \(encodingMode) must not disable mouse tracking")
+        }
+    }
+
+    @Test func decrstEncodingModeStillResetsEncoding() {
+        // After ?1006l events are reported in the default X10 encoding again.
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1000h")
+        terminal.feed(text: "\(esc)[?1006h")
+        terminal.feed(text: "\(esc)[?1006l")
+        delegate.clearSentData()
+
+        let buttonFlags = terminal.encodeButton(button: 4, release: false, shift: false, meta: false, control: false)
+        terminal.sendEvent(buttonFlags: buttonFlags, x: 10, y: 5, pixelX: 10, pixelY: 5)
+
+        let sentBytes = delegate.sentData.flatMap { $0 }
+        let expected: [UInt8] = [0x1b, UInt8(ascii: "["), UInt8(ascii: "M"), 96, 43, 38]
+        #expect(sentBytes == expected)
+    }
+
+    @Test func decrstEncodingModeReportedViaDecrqm() {
+        // DECRQM after ?1006l: the encoding reports reset while tracking reports set.
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1003h")
+        terminal.feed(text: "\(esc)[?1006h")
+        terminal.feed(text: "\(esc)[?1006l")
+        delegate.clearSentData()
+
+        terminal.feed(text: "\(esc)[?1006$p")
+        terminal.feed(text: "\(esc)[?1003$p")
+
+        let responses = delegate.sentData.map { String(bytes: $0, encoding: .utf8) ?? "" }
+        #expect(responses == ["\(esc)[?1006;2$y", "\(esc)[?1003;1$y"])
+    }
+
+    @Test func moshStyleModeReassertKeepsTrackingAndSgrEncoding() {
+        // mosh re-asserts mouse state on every resize/reattach repaint as
+        // "CSI ?1003l ?1003h ?1004l ?1006l ?1006h"; the trailing ?1006l used to
+        // disable tracking right after ?1003h re-enabled it, leaving mouse
+        // reporting permanently off after the first resize.
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1003h\(esc)[?1006h") // app enables mouse reporting
+        terminal.feed(text: "\(esc)[?1003l\(esc)[?1003h\(esc)[?1004l\(esc)[?1006l\(esc)[?1006h")
+        #expect(terminal.mouseMode == .anyEvent)
+        delegate.clearSentData()
+
+        // Events must still flow, SGR-encoded.
+        let buttonFlags = terminal.encodeButton(button: 4, release: false, shift: false, meta: false, control: false)
+        terminal.sendEvent(buttonFlags: buttonFlags, x: 10, y: 5, pixelX: 10, pixelY: 5)
+
+        let sentString = String(bytes: delegate.sentData.flatMap { $0 }, encoding: .utf8) ?? ""
+        #expect(sentString == "\(esc)[<64;11;6M")
+    }
+
+    @Test func decrstTrackingModeStillDisablesTracking() {
+        // The tracking modes themselves still turn tracking off, also when an
+        // encoding is active.
+        let (terminal, _) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1003h")
+        terminal.feed(text: "\(esc)[?1006h")
+        terminal.feed(text: "\(esc)[?1003l")
+        #expect(terminal.mouseMode == .off)
+    }
 }

@@ -342,16 +342,14 @@ open class Terminal {
 
     private let synchronizedOutputTimeoutSeconds: TimeInterval = 1.0
     public private(set) var synchronizedOutputActive: Bool = false
-    private var synchronizedOutputBuffer: Buffer?
-    private var synchronizedOutputBufferIsAlternate: Bool = false
     private var synchronizedOutputTimeoutItem: DispatchWorkItem?
 
     var displayBuffer: Buffer {
-        synchronizedOutputBuffer ?? buffer
+        buffer
     }
 
     var isDisplayBufferAlternate: Bool {
-        synchronizedOutputBuffer != nil ? synchronizedOutputBufferIsAlternate : isCurrentBufferAlternate
+        isCurrentBufferAlternate
     }
     
     public var isCurrentBufferAlternate: Bool {
@@ -639,6 +637,10 @@ open class Terminal {
         }
     }
 
+    /// Whether the running application has requested shift capture via XTSHIFTESCAPE (`CSI > 1 s`).
+    /// When `true`, shift+click is forwarded to the app instead of triggering local text selection.
+    public private(set) var mouseShiftCapture: Bool = false
+
     // The next four variables determine whether setting/querying should be done using utf8 or latin1
     // and whether the values should be set or queried using hex digits, rather than actual byte streams
     var xtermTitleSetUtf = false
@@ -777,7 +779,7 @@ open class Terminal {
     
     public func resetNormalBuffer() {
         normalBuffer = Buffer(cols: cols, rows: rows, tabStopWidth: tabStopWidth, scrollback: options.scrollback)
-        normalBuffer.scroll = scroll(isWrapped:)
+        normalBuffer.scroll = { [weak self] wrapped in self?.scroll(isWrapped: wrapped) }
 
         normalBuffer.fillViewportRows()
         normalBuffer.setupTabStops(tabStopWidth: tabStopWidth)
@@ -868,7 +870,8 @@ open class Terminal {
         curAttr = CharData.defaultAttr
         
         mouseMode = .off
-        
+        mouseShiftCapture = false
+
         buffer.scrollTop = 0
         buffer.scrollBottom = rows-1
         buffer.marginLeft = 0
@@ -4162,17 +4165,18 @@ open class Terminal {
             case 1004: // send focusin/focusout events
                 sendFocus = false
             case 1005: // utf8 ext mode mouse
+                // Resets the coordinate encoding only: 1005/1006/1015/1016 select how mouse
+                // events are encoded, independent of the tracking modes (9/1000-1003). xterm
+                // keeps tracking enabled when an encoding is reset; turning mouseMode off here
+                // broke clients (e.g. mosh re-asserts modes as "CSI ?1003l ?1003h ?1006l ?1006h"
+                // on every resize, which left tracking permanently disabled).
                 mouseProtocol = .x10
-                mouseMode = .off
             case 1006: // sgr ext mode mouse
                 mouseProtocol = .x10
-                mouseMode = .off
             case 1015: // urxvt ext mode mouse
                 mouseProtocol = .x10
-                mouseMode = .off
             case 1016: // sgrPixel mode
                 mouseProtocol = .x10
-                mouseMode = .off
             case 25: // hide cursor
                 hideCursor ()
             case 1048: // alt screen cursor
@@ -5539,17 +5543,14 @@ open class Terminal {
         // This should call the viewport sync-scroll-area
     }
 
+    // Mirrors ghostty: flip a flag and arm a safety timer. The view layer pauses
+    // rendering while the flag is set (see updateDisplay's early-return). The
+    // live buffer is mutated normally; no snapshot is taken.
     private func beginSynchronizedOutput ()
     {
         let wasActive = synchronizedOutputActive
-        if !synchronizedOutputActive {
-            synchronizedOutputActive = true
-            synchronizedOutputBuffer = snapshotBuffer(buffer)
-            synchronizedOutputBufferIsAlternate = isCurrentBufferAlternate
-        } else if synchronizedOutputBuffer == nil {
-            synchronizedOutputBuffer = snapshotBuffer(buffer)
-            synchronizedOutputBufferIsAlternate = isCurrentBufferAlternate
-        }
+        SyncDebug.log("BSU wasActive=\(wasActive)")
+        synchronizedOutputActive = true
         scheduleSynchronizedOutputTimeout()
         if !wasActive {
             tdel?.synchronizedOutputChanged(source: self, active: true)
@@ -5559,11 +5560,11 @@ open class Terminal {
     private func endSynchronizedOutput ()
     {
         guard synchronizedOutputActive else {
+            SyncDebug.log("ESU ignored (not active)")
             return
         }
+        SyncDebug.log("ESU")
         synchronizedOutputActive = false
-        synchronizedOutputBuffer = nil
-        synchronizedOutputBufferIsAlternate = false
         synchronizedOutputTimeoutItem?.cancel()
         synchronizedOutputTimeoutItem = nil
         refresh (startRow: 0, endRow: rows - 1)
@@ -5577,47 +5578,16 @@ open class Terminal {
             guard let self, self.synchronizedOutputActive else {
                 return
             }
+            SyncDebug.log("safety-timer-fired (missing ESU)")
             self.endSynchronizedOutput()
         }
         synchronizedOutputTimeoutItem = workItem
         DispatchQueue.main.asyncAfter(deadline: .now() + synchronizedOutputTimeoutSeconds, execute: workItem)
     }
 
-    private func snapshotBuffer (_ source: Buffer) -> Buffer
-    {
-        let copy = Buffer(cols: source.cols, rows: source.rows, tabStopWidth: tabStopWidth, scrollback: source.scrollback)
-        copy.xDisp = source.xDisp
-        copy.yDisp = source.yDisp
-        copy.xBase = source.xBase
-        copy.linesTop = source.linesTop
-        copy.yBase = source.yBase
-        copy.x = source.x
-        copy.y = source.y
-        copy.scrollTop = source.scrollTop
-        copy.scrollBottom = source.scrollBottom
-        copy.tabStops = source.tabStops
-        copy.savedX = source.savedX
-        copy.savedY = source.savedY
-        copy.savedOriginMode = source.savedOriginMode
-        copy.savedMarginMode = source.savedMarginMode
-        copy.savedWraparound = source.savedWraparound
-        copy.savedReverseWraparound = source.savedReverseWraparound
-        copy.marginLeft = source.marginLeft
-        copy.marginRight = source.marginRight
-        copy.savedAttr = source.savedAttr
-        copy.savedCharset = source.savedCharset
-        copy.scrollback = source.scrollback
-
-        for idx in 0..<source.lines.count {
-            copy.lines.push(BufferLine(from: source.lines[idx]))
-        }
-        return copy
-    }
-
     func setViewYDisp (_ newValue: Int)
     {
         buffer.yDisp = newValue
-        synchronizedOutputBuffer?.yDisp = newValue
     }
 
     /**
@@ -5668,6 +5638,19 @@ open class Terminal {
         }
     }
     
+    // XTSHIFTESCAPE (CSI > Ps s)
+    func cmdSetShiftEscape (_ pars: [Int]) {
+        let ps = pars.isEmpty ? 0 : pars[0]
+        switch ps {
+        case 0:
+            mouseShiftCapture = false
+        case 1:
+            mouseShiftCapture = true
+        default:
+            break
+        }
+    }
+
     /**
      * Encodes the button action in the format expected by the client
      * - Parameter button: The button to encode

@@ -191,18 +191,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     var search: SearchService!
     var debug: UIView?
     var pendingDisplay: Bool = false
-    /// Debounce timer for sync-end render — coalesces rapid sync block sequences.
-    var syncEndRenderTimer: DispatchWorkItem? = nil
-    /// True from first BSU until syncSequenceSettleMs after last ESU.
-    var inSyncSequence: Bool = false
-    /// Milliseconds to wait after the last ESU before rendering.
-    var syncSequenceSettleMs: Int = 100
 #if canImport(MetalKit)
     var metalView: MTKView?
     var metalRenderer: MetalTerminalRenderer?
     var pendingMetalDisplay: Bool = false
     private var useMetalRenderer = false
     var metalDirtyRange: ClosedRange<Int>?
+    /// The cursor position last submitted to the Metal renderer. Used to
+    /// detect pure cursor-only moves (no rows dirty) such as the
+    /// CSI Ps C / CSI Ps D sequences shells emit in response to Option+Arrow
+    /// word jumps, which would otherwise leave the cursor visually stuck
+    /// because `MTKView` is paused and only redraws on demand.
+    var lastRenderedCursor: (x: Int, y: Int, hidden: Bool)?
 
     /// Whether the terminal view is currently using the Metal GPU renderer.
     ///
@@ -386,6 +386,14 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             mtkView.framebufferOnly = true
             mtkView.colorPixelFormat = .bgra8Unorm
             mtkView.isUserInteractionEnabled = false
+            // Tag the metal layer with sRGB so the compositor color-manages our
+            // pixels the same way as a regular UIView's layer. Without this,
+            // CAMetalLayer is untagged and raw bytes are treated as
+            // already-in-display-gamut, oversaturating colors on wide-gamut
+            // displays.
+            if let metalLayer = mtkView.layer as? CAMetalLayer {
+                metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+            }
             let renderer = try MetalTerminalRenderer(view: mtkView, terminalView: self)
             mtkView.delegate = renderer
             if let caretView = caretView {
@@ -709,11 +717,19 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         contentOffset.y = max(0, CGFloat(lines) - bottomVisibleLine) * cellDimension.height
     }
     
+    /// Returns true when the user is holding Shift on an attached hardware keyboard
+    /// and the running application has not opted in to capturing shift via XTSHIFTESCAPE.
+    /// In that case the gesture should fall through to local selection handling instead
+    /// of being forwarded to the application as a mouse event.
+    private func shiftBypassesMouseReporting(for gestureRecognizer: UIGestureRecognizer) -> Bool {
+        gestureRecognizer.modifierFlags.contains(.shift) && !terminal.mouseShiftCapture
+    }
+
     @objc func singleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
         if isFirstResponder {
             guard gestureRecognizer.view != nil else { return }
-                 
+
             if gestureRecognizer.state != .ended {
                 return
             }
@@ -724,7 +740,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
                 return
             }
 
-            if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+            if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
                 sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
                 if terminal.mouseMode.sendButtonRelease() {
@@ -756,12 +772,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     @objc func doubleTap (_ gestureRecognizer: UITapGestureRecognizer)
     {
         guard gestureRecognizer.view != nil else { return }
-               
+
         if gestureRecognizer.state != .ended {
             return
         }
-        
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
             
             if terminal.mouseMode.sendButtonRelease() {
@@ -786,7 +802,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return
         }
 
-        if allowMouseReporting && terminal.mouseMode.sendButtonPress() {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode.sendButtonPress() {
             sharedMouseEvent(gestureRecognizer: gestureRecognizer, release: false)
 
             if terminal.mouseMode.sendButtonRelease() {
@@ -882,7 +898,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     
     @objc func panMouseHandler (_ gestureRecognizer: UIPanGestureRecognizer){
         guard gestureRecognizer.view != nil else { return }
-        if allowMouseReporting && terminal.mouseMode != .off {
+        if allowMouseReporting && !shiftBypassesMouseReporting(for: gestureRecognizer) && terminal.mouseMode != .off {
             switch gestureRecognizer.state {
             case .began:
                 // send the initial tap
@@ -1198,6 +1214,16 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         setupOptions(width: bounds.width, height: bounds.height)
         layer.backgroundColor = nativeBackgroundColor.cgColor
         nativeBackgroundColor = UIColor.clear
+        // The terminal background is provided by `layer.backgroundColor`, and
+        // `draw(_:)` paints glyph cells with a transparent backdrop so that the
+        // layer colour shows through the gaps. That only works if the view is
+        // non-opaque: an opaque view gets an alpha-less graphics context where
+        // the transparent fill is a no-op, leaving uninitialised backing-store
+        // garbage in every default-background region. When the scroll view blits
+        // and re-exposes strips during scrolling, that garbage becomes visible as
+        // flickering/striped corruption. Marking the view non-opaque makes the
+        // transparent compositing behave as intended.
+        isOpaque = false
     }
     
     var _nativeFg, _nativeBg: TTColor!
@@ -1287,6 +1313,57 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         set {
             _selectionHandleColor = newValue
         }
+    }
+
+    /// Whether the terminal currently has an active text selection.
+    ///
+    /// Exposed publicly so embedders (e.g. a UIScrollView subclass that
+    /// hosts the terminal) can veto their own gesture recognisers while
+    /// the user is dragging a selection handle. The underlying
+    /// `SelectionService` is intentionally `internal`; this read-only
+    /// accessor is the minimum public surface needed for the common
+    /// "don't scroll while I'm dragging the selection handle" pattern.
+    ///
+    /// Added by the meshTerm fork (`v1.13.0-meshterm.1`). An upstream
+    /// PR has been filed mirroring this accessor; once merged we will
+    /// switch back to upstream and drop the fork.
+    public var hasActiveSelection: Bool {
+        return selection?.active ?? false
+    }
+
+    /// Programmatically sets the selection range to the given buffer
+    /// positions. Useful for callers that want to highlight a region
+    /// without going through a drag gesture — e.g. a search overlay
+    /// that wants match cells to light up with the same visual
+    /// treatment as a user-driven selection. Coordinates are
+    /// buffer-relative `Position` values. The view's internal
+    /// selection rendering picks up the change automatically.
+    public func setSelectionRange(start: Position, end: Position) {
+        selection?.setSelection(start: start, end: end)
+    }
+
+    /// Clears any active selection. Companion to `setSelectionRange`
+    /// for callers that don't have a UIResponder hook into the menu
+    /// system (where `selectNone` would otherwise come from).
+    public func clearSelection() {
+        selection?.selectNone()
+    }
+
+    /// Programmatically presents SwiftTerm's standard Copy / Paste /
+    /// Select All context menu at the given point in the terminal's
+    /// coordinate space. Mirrors the path the built-in long-press
+    /// gesture takes — becomes first responder, computes the menu
+    /// region around the tap point, then calls the existing internal
+    /// `showContextMenu(forRegion:pos:)` presenter.
+    ///
+    /// Useful when a host app replaces the built-in long-press gesture
+    /// with custom behaviour (e.g. a cursor-drag mode) but still wants
+    /// the existing menu as a fallback for release-without-movement.
+    public func showStandardContextMenu(at point: CGPoint) {
+        _ = becomeFirstResponder()
+        let region = makeContextMenuRegionForTap(point: point)
+        let hit = calculateTapHit(point: point)
+        showContextMenu(forRegion: region, pos: hit.grid)
     }
 
     var lineAscent: CGFloat = 0
@@ -1584,7 +1661,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
             return normalized
         }
         guard isAutoPeriodReplacement(text) else { return nil }
-        guard rangeToReplace.endPosition.offset == textInputStorage.count else { return nil }
+        guard rangeToReplace.endPosition.offset == textInputStorage.textInputUTF16Count else { return nil }
         guard oldText.count <= 2 else { return nil }
         guard oldText.allSatisfy({ $0 == " " }) else { return nil }
         if text == "." {
@@ -1610,7 +1687,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         pendingAutoPeriodDeleteWasSpace = false
         guard text == ". " else { return nil }
         guard rangeToReplace.isEmpty else { return nil }
-        guard rangeToReplace.endPosition.offset == textInputStorage.count else { return nil }
+        guard rangeToReplace.endPosition.offset == textInputStorage.textInputUTF16Count else { return nil }
         guard textInputStorage.last == " " else { return nil }
         uitiLog("auto-period insertion range text:\(text.debugDescription) -> \" \"")
         return " "
@@ -1640,7 +1717,10 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         let rangeStartIndex = rangeToReplace.startPosition.offset
         textInputStorage.replaceSubrange(rangeToReplace.fullRange(in: textInputStorage), with: textToInsert)
         _markedTextRange = nil
-        let insertedPosition = TextPosition(offset: rangeStartIndex + textToInsert.count)
+        let insertedOffset = textInputStorage.textInputValidUTF16Offset(
+            rangeStartIndex + textToInsert.textInputUTF16Count,
+            rounding: .forward)
+        let insertedPosition = TextPosition(offset: insertedOffset)
         _selectedTextRange = TextRange(from: insertedPosition, to: insertedPosition)
 
         endTextInputEdit()
@@ -2068,7 +2148,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
     private func tryComposeKoreanFinal(_ text: String) -> Bool {
         guard let language = textInputMode?.primaryLanguage, language.hasPrefix("ko") else { return false }
         guard _markedTextRange == nil else { return false }
-        guard _selectedTextRange.isEmpty, _selectedTextRange.endPosition.offset == textInputStorage.count else { return false }
+        guard _selectedTextRange.isEmpty, _selectedTextRange.endPosition.offset == textInputStorage.textInputUTF16Count else { return false }
         guard text.count == 1, let jamo = text.first else { return false }
         guard let finalIndex = koreanFinalIndex[jamo] else { return false }
         guard let lastChar = textInputStorage.last else { return false }
@@ -2079,7 +2159,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         beginTextInputEdit()
         textInputStorage.removeLast()
         textInputStorage.append(composed)
-        let newOffset = textInputStorage.count
+        let newOffset = textInputStorage.textInputUTF16Count
         _markedTextRange = nil
         _selectedTextRange = TextRange(from: TextPosition(offset: newOffset), to: TextPosition(offset: newOffset))
         endTextInputEdit()
@@ -2128,13 +2208,12 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
     func ensureCaretIsVisible ()
     {
-        // Suppress during sync blocks and inter-block gaps.
-        guard !terminal.synchronizedOutputActive && !inSyncSequence else { return }
+        guard !terminal.synchronizedOutputActive else { return }
         let displayBuffer = terminal.displayBuffer
         contentOffset = CGPoint (x: 0, y: CGFloat (displayBuffer.lines.count-displayBuffer.rows)*cellDimension.height)
     }
     
-    public func deleteBackward() {
+    open func deleteBackward() {
         uitiLog("deleteBackward() \(textInputStateDescription())")
 
         // after backward deletion, marked range is always cleared, and length of selected range is always zero
@@ -2156,12 +2235,18 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
 
             beginTextInputEdit()
 
-            rangeStartIndex -= 1
-            let deleteIndex = textInputStorage.index(textInputStorage.startIndex, offsetBy: rangeStartIndex)
-            let deletedChar = textInputStorage[deleteIndex]
-            let deletingAtEnd = rangeStartPosition.offset == textInputStorage.count
+            guard let deleteRange = textInputStorage.textInputCharacterRange(beforeUTF16Offset: rangeStartIndex) else {
+                pendingAutoPeriodDeleteWasSpace = false
+                self.sendBackspaceKey()
+                uitiLog("deleteBackward() no text to delete, sending backspace")
+                endTextInputEdit()
+                return
+            }
+            rangeStartIndex = textInputStorage.textInputUTF16Offset(of: deleteRange.lowerBound)
+            let deletedChar = textInputStorage[deleteRange]
+            let deletingAtEnd = rangeStartPosition.offset == textInputStorage.textInputUTF16Count
             pendingAutoPeriodDeleteWasSpace = deletingAtEnd && deletedChar == " " && _markedTextRange == nil
-            textInputStorage.remove(at: deleteIndex)
+            textInputStorage.removeSubrange(deleteRange)
             rangeStartPosition = TextPosition(offset: rangeStartIndex)
 
             self.sendBackspaceKey()
