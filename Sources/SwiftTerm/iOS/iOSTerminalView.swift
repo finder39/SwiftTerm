@@ -2933,7 +2933,7 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
  
 #if canImport(MetalKit)
             if self.metalView != nil {
-                self.metalDirtyRange = self.metalVisibleRange()
+                self.accumulateMetalDirty(self.metalVisibleRange())
                 self.queueMetalDisplay()
             } else {
                 self.setNeedsDisplay(self.bounds)

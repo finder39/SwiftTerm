@@ -2319,16 +2319,10 @@ open class TerminalView: NSView, NSTextInputClient, NSUserInterfaceValidations, 
         #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
-            if buffer.lines.count == 0 {
-                metalDirtyRange = nil
-            } else {
+            if buffer.lines.count != 0 {
                 let startRow = buffer.yDisp
                 let endRow = min(buffer.lines.count - 1, buffer.yDisp + buffer.rows - 1)
-                if startRow <= endRow {
-                    metalDirtyRange = startRow...endRow
-                } else {
-                    metalDirtyRange = nil
-                }
+                accumulateMetalDirty(startRow <= endRow ? startRow...endRow : nil)
             }
             queueMetalDisplay()
             return

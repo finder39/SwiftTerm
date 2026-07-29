@@ -152,7 +152,17 @@ extension TerminalView {
             resize(cols: newCols, rows: newRows)
         }
         updateCaretView()
-        
+
+        // Under Metal the outer view never draws, so the invalidations below are ignored
+        // and an idle terminal keeps the old font until the next PTY output or resize.
+        // No cache invalidation is needed here: the CacheSignature already covers
+        // fontName/fontSize/cell dims and the glyph atlas is keyed by PostScript name.
+        #if canImport(MetalKit)
+        if metalView != nil {
+            requestMetalDisplay()
+            return
+        }
+        #endif
         #if os(macOS)
         needsDisplay = true
         #else
@@ -1855,28 +1865,19 @@ extension TerminalView {
 #if canImport(MetalKit)
         if metalView != nil {
             let buffer = terminal.displayBuffer
-            if buffer.lines.count == 0 {
-                metalDirtyRange = nil
-            } else {
+            if buffer.lines.count != 0 {
                 let maxRow = buffer.lines.count - 1
                 let visibleStart = buffer.yDisp
                 let visibleEnd = min(maxRow, buffer.yDisp + buffer.rows - 1)
+                let visibleRange = visibleStart <= visibleEnd ? visibleStart...visibleEnd : nil
                 if rowStart >= 0 && rowEnd >= rowStart && rowEnd < terminal.rows {
                     let absStart = buffer.yDisp + rowStart
                     let absEnd = buffer.yDisp + rowEnd
                     let clampedStart = max(0, min(absStart, maxRow))
                     let clampedEnd = max(0, min(absEnd, maxRow))
-                    if clampedStart <= clampedEnd {
-                        metalDirtyRange = clampedStart...clampedEnd
-                    } else if visibleStart <= visibleEnd {
-                        metalDirtyRange = visibleStart...visibleEnd
-                    } else {
-                        metalDirtyRange = nil
-                    }
-                } else if visibleStart <= visibleEnd {
-                    metalDirtyRange = visibleStart...visibleEnd
+                    accumulateMetalDirty(clampedStart <= clampedEnd ? clampedStart...clampedEnd : visibleRange)
                 } else {
-                    metalDirtyRange = nil
+                    accumulateMetalDirty(visibleRange)
                 }
             }
             lastRenderedCursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
@@ -1892,7 +1893,7 @@ extension TerminalView {
         // life data being fed into it.
         #if canImport(MetalKit)
         if metalView != nil {
-            metalDirtyRange = metalVisibleRange()
+            accumulateMetalDirty(metalVisibleRange())
             let buffer = terminal.displayBuffer
             lastRenderedCursor = (x: buffer.x, y: buffer.yBase + buffer.y, hidden: terminal.cursorHidden)
             requestMetalDisplay()
@@ -1985,6 +1986,23 @@ extension TerminalView {
     }
 
 #if canImport(MetalKit)
+    /// Union a newly-dirty row range into the pending Metal dirty range.
+    ///
+    /// The renderer is the only consumer/clearer of `metalDirtyRange`: it reads
+    /// the range and nils it out in `draw()`. Producers must never clobber a
+    /// range that has not been consumed yet — if two producer passes run before
+    /// the MTKView actually draws (occluded window, dropped frame, minimized),
+    /// a plain assignment loses the first range and those rows keep their stale
+    /// cached vertices. A `nil` argument means "nothing new", so it is a no-op.
+    func accumulateMetalDirty(_ newRange: ClosedRange<Int>?) {
+        guard let newRange else { return }
+        if let existing = metalDirtyRange {
+            metalDirtyRange = min(existing.lowerBound, newRange.lowerBound)...max(existing.upperBound, newRange.upperBound)
+        } else {
+            metalDirtyRange = newRange
+        }
+    }
+
     func requestMetalDisplay() {
         guard let metalView = metalView else {
             return
