@@ -515,6 +515,7 @@ struct FrameViewState: Sendable {
     let useBrightColors: Bool
     let bidiHostPolicy: BidiHostPolicy
     let glyphFallbackProvider: (any TerminalGlyphFallbackProvider)?
+    let ansiColorPairMapper: (any TerminalAnsiColorPairMapper)?
 
     var effectiveForegroundColor: FrameColor { appearance.effectiveForegroundColor }
     var effectiveBackgroundColor: FrameColor { appearance.effectiveBackgroundColor }
@@ -555,6 +556,7 @@ struct FrameViewState: Sendable {
         useBrightColors = view.useBrightColors
         bidiHostPolicy = view.bidiHostPolicy
         glyphFallbackProvider = view.glyphFallbackProvider
+        ansiColorPairMapper = view.ansiColorPairMapper
     }
 }
 
@@ -620,6 +622,7 @@ struct SnapshotRenderContext {
     let useBrightColors: Bool
     let bidiHostPolicy: BidiHostPolicy
     let glyphFallbackProvider: (any TerminalGlyphFallbackProvider)?
+    let ansiColorPairMapper: (any TerminalAnsiColorPairMapper)?
     let cols: Int
 
     /// Identifies the values used to build attributed-string dictionaries.
@@ -678,6 +681,7 @@ struct SnapshotRenderContext {
         useBrightColors = viewState.useBrightColors
         bidiHostPolicy = viewState.bidiHostPolicy
         glyphFallbackProvider = viewState.glyphFallbackProvider
+        ansiColorPairMapper = viewState.ansiColorPairMapper
         self.cols = cols
 
         var identityHasher = Hasher()
@@ -686,6 +690,7 @@ struct SnapshotRenderContext {
         identityHasher.combine(fonts.italic.hash)
         identityHasher.combine(fonts.boldItalic.hash)
         identityHasher.combine(glyphFallbackProvider?.cacheIdentity ?? 0)
+        identityHasher.combine(ansiColorPairMapper?.cacheIdentity ?? 0)
         identityHasher.combine(effectiveForegroundColor.hash)
         identityHasher.combine(effectiveBackgroundColor.hash)
         identityHasher.combine(selectedTextBackgroundColor.hash)

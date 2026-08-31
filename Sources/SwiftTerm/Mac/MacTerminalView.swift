@@ -1266,6 +1266,17 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
         }
     }
 
+    /// Host-supplied remapping of the resolved foreground/background pair for
+    /// each cell, applied after the palette lookup, the `inverse` swap and the
+    /// `dim` blend. `nil`, the default, leaves rendering unchanged.
+    /// See ``TerminalAnsiColorPairMapper``.
+    public var ansiColorPairMapper: (any TerminalAnsiColorPairMapper)? = nil {
+        didSet {
+            withTerminal { $0.updateFullScreen() }
+            frameDriver.markDirty()
+        }
+    }
+
     /// When true, custom block/box glyphs use anti-aliasing instead of pixel-aligned edges.
     public var antiAliasCustomBlockGlyphs: Bool = false {
         didSet {
@@ -3824,7 +3835,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     private static let logsMouseInput =
         ProcessInfo.processInfo.environment["SWIFTTERM_MOUSE_LOG"] == "1"
 
-    public override func scrollWheel(with event: NSEvent) {
+    open override func scrollWheel(with event: NSEvent) {
         // Preserves the previous `deltaY == 0` early exit, restated against the
         // delta this method now reads. Without it a zero delta would fall into
         // the non-precise branch below and be turned into a spurious -1 line.

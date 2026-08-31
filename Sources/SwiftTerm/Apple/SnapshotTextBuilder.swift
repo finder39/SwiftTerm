@@ -248,10 +248,21 @@ final class SnapshotTextBuilder {
 
         var foregroundColor = mapColor(color: foreground, isFg: true,
                                        isBold: isBold, context: context)
-        let backgroundColor = mapColor(color: background, isFg: false,
+        var backgroundColor = mapColor(color: background, isFg: false,
                                        isBold: false, context: context)
         if flags.contains(.dim) {
             foregroundColor = foregroundColor.dimmedColor(towards: backgroundColor)
+        }
+        // Last step before the pair is committed to the dictionary: the host
+        // sees exactly what would be drawn, inverse and dim included. The
+        // result is cached per attribute, which is why the mapper's identity is
+        // folded into `context.identity` (see SnapshotRenderContext).
+        if let mapper = context.ansiColorPairMapper,
+           let remapped = mapper.mapColorPair(attribute: attribute,
+                                              foreground: foregroundColor,
+                                              background: backgroundColor) {
+            foregroundColor = remapped.foreground
+            backgroundColor = remapped.background
         }
         var result: [NSAttributedString.Key: Any] = [
             .font: font,

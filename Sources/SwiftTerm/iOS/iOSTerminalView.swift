@@ -1549,6 +1549,17 @@ open class TerminalView: UIScrollView, UITextInputTraits, UIKeyInput, UIScrollVi
         }
     }
 
+    /// Host-supplied remapping of the resolved foreground/background pair for
+    /// each cell, applied after the palette lookup, the `inverse` swap and the
+    /// `dim` blend. `nil`, the default, leaves rendering unchanged.
+    /// See ``TerminalAnsiColorPairMapper``.
+    public var ansiColorPairMapper: (any TerminalAnsiColorPairMapper)? = nil {
+        didSet {
+            withTerminal { $0.updateFullScreen() }
+            frameDriver.markDirty()
+        }
+    }
+
     /// When true, custom block/box glyphs use anti-aliasing instead of pixel-aligned edges.
     public var antiAliasCustomBlockGlyphs: Bool = false {
         didSet {
