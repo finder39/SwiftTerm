@@ -507,4 +507,41 @@ struct MouseTrackingTests {
         terminal.feed(text: "\(esc)[?1003l")
         #expect(terminal.mouseMode == .off)
     }
+
+    // MARK: - No-button motion (1003) must not be misencoded as a button release
+
+    @Test func noButtonMotionEncodesAsMotionNotRelease() {
+        // Regression: under any-event tracking (1003) + SGR (1006), a hover move
+        // with no button held is reported by sendMotion as Cb = 3 | 32 = 35.
+        // The low two bits (3) look like a button release, but the +32 motion bit
+        // means it is motion, not a release. The SGR branch must keep the motion
+        // guard `(buttonFlags & 32) == 0` so this encodes as `ESC[<35;col;row M`
+        // (motion) and NOT `ESC[<32;col;row m` (a phantom left-button release),
+        // which made TUIs open hyperlinks on hover.
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1003h")
+        terminal.feed(text: "\(esc)[?1006h")
+        delegate.clearSentData()
+
+        // sendMotion adds the +32 motion bit; button 3 = "no button held".
+        terminal.sendMotion(buttonFlags: 3, x: 10, y: 5, pixelX: 10, pixelY: 5)
+
+        let sentString = String(bytes: delegate.sentData.flatMap { $0 }, encoding: .utf8) ?? ""
+        #expect(sentString == "\(esc)[<35;11;6M")
+    }
+
+    @Test func realButtonReleaseStillEncodesAsRelease() {
+        // The motion guard must not break genuine releases: Cb = 3 with no motion
+        // bit is a real left-button release and must still encode as lowercase m
+        // with the low bits stripped (`ESC[<0;col;row m`).
+        let (terminal, delegate) = TerminalTestHarness.makeTerminal()
+        terminal.feed(text: "\(esc)[?1000h")
+        terminal.feed(text: "\(esc)[?1006h")
+        delegate.clearSentData()
+
+        terminal.sendEvent(buttonFlags: 3, x: 10, y: 5, pixelX: 10, pixelY: 5)
+
+        let sentString = String(bytes: delegate.sentData.flatMap { $0 }, encoding: .utf8) ?? ""
+        #expect(sentString == "\(esc)[<0;11;6m")
+    }
 }
